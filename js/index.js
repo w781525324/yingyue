@@ -788,6 +788,17 @@ const API = {
                 throw new Error(`Request failed with status ${response.status}`);
             }
 
+            const cacheStatus = response.headers.get("X-Cache-Status");
+            if (cacheStatus) {
+                const urlObj = new URL(url, window.location.origin);
+                const type = urlObj.searchParams.get("types") || "未知接口";
+                if (cacheStatus === "HIT") {
+                    debugLog(`[边缘缓存] 命中接口数据: ${type}`);
+                } else if (cacheStatus === "MISS") {
+                    debugLog(`[穿透回源] 拉取接口数据: ${type}`);
+                }
+            }
+
             const text = await response.text();
             try {
                 return JSON.parse(text);
@@ -951,20 +962,61 @@ const state = {
 
 let importSelectedMenuOutsideHandler = null;
 
-if (state.currentList === "favorite" && (!Array.isArray(state.favoriteSongs) || state.favoriteSongs.length === 0)) {
+/**
+ * 状态自洽性检查：
+ * 如果当前指向的播放列表为空，则清除当前歌曲状态，防止“幽灵播放”
+ */
+function validateStateConsistency() {
+    const isPlaylistEmpty = () => {
+        if (state.currentPlaylist === 'playlist') return state.playlistSongs.length === 0;
+        if (state.currentPlaylist === 'favorites') return state.favoriteSongs.length === 0;
+        if (state.currentPlaylist === 'search') return state.searchResults.length === 0;
+        if (state.currentPlaylist === 'online') return state.onlineSongs.length === 0;
+        return false;
+    };
+
+    if (isPlaylistEmpty() && state.currentSong !== null) {
+        debugLog("检测到列表为空，清除幽灵播放歌曲");
+        state.currentSong = null;
+        state.currentTrackIndex = -1;
+        state.currentAudioUrl = null;
+        state.currentPlaybackTime = 0;
+        
+        // 更新本地持久化
+        safeRemoveLocalStorage("currentSong", { skipRemote: true });
+        safeSetLocalStorage("currentTrackIndex", "-1", { skipRemote: true });
+        
+        // 更新 UI (如果 DOM 已加载)
+        if (dom.currentSongTitle) dom.currentSongTitle.textContent = "选择一首歌曲开始播放";
+        if (dom.currentSongArtist) dom.currentSongArtist.textContent = "未知艺术家";
+        if (typeof showAlbumCoverPlaceholder === "function") showAlbumCoverPlaceholder();
+        if (typeof updateMobileToolbarTitle === "function") updateMobileToolbarTitle();
+        if (typeof updatePlayPauseButton === "function") updatePlayPauseButton();
+    }
+}
+
+// 规范化收藏夹数据
+state.favoriteSongs = (typeof ensureFavoriteSongsArray === "function" ? ensureFavoriteSongsArray() : (state.favoriteSongs || []))
+    .map((song) => (typeof sanitizeImportedSong === "function" ? sanitizeImportedSong(song) : song) || song)
+    .filter((song) => song && typeof song === "object");
+
+// 确保 currentList 状态正确
+if (state.currentList === "favorite" && state.favoriteSongs.length === 0) {
     state.currentList = "playlist";
 }
 if (state.currentList === "favorite") {
     state.currentPlaylist = "favorites";
 }
-state.favoriteSongs = ensureFavoriteSongsArray()
-    .map((song) => sanitizeImportedSong(song) || song)
-    .filter((song) => song && typeof song === "object");
-if (!Array.isArray(state.favoriteSongs) || state.favoriteSongs.length === 0) {
+
+// 修正收藏夹索引
+if (state.favoriteSongs.length === 0) {
     state.currentFavoriteIndex = 0;
 } else if (state.currentFavoriteIndex >= state.favoriteSongs.length) {
     state.currentFavoriteIndex = state.favoriteSongs.length - 1;
 }
+
+// 启动时执行一次自洽性检查
+validateStateConsistency();
 saveFavoriteState();
 
 async function bootstrapPersistentStorage() {
@@ -975,6 +1027,8 @@ async function bootstrapPersistentStorage() {
             return;
         }
         applyPersistentSnapshotFromRemote(snapshot.data);
+        // 远程同步后再次检查自洽性
+        validateStateConsistency();
     } catch (error) {
         console.warn("加载远程存储失败", error);
     } finally {
@@ -2154,13 +2208,14 @@ async function updateDynamicBackground(imageUrl) {
         paletteCache.delete(imageUrl);
         paletteCache.set(imageUrl, cached);
         queuePaletteApplication(cached, imageUrl);
-        debugLog("动态背景加载成功");
+        debugLog("[本地缓存] 动态背景提取成功");
+        console.log(`[Palette CACHE] Loaded colors from local cache: ${imageUrl}`);
         return;
     }
 
     if (state.currentPaletteImage === imageUrl && state.dynamicPalette) {
         queuePaletteApplication(state.dynamicPalette, imageUrl);
-        debugLog("动态背景加载成功");
+        debugLog("[内存复用] 动态背景提取成功");
         return;
     }
 
@@ -2178,17 +2233,19 @@ async function updateDynamicBackground(imageUrl) {
             return;
         }
         queuePaletteApplication(palette, imageUrl);
-        debugLog("动态背景加载成功");
+        debugLog("[后端解析] 动态背景提取成功");
+        console.log(`[Palette BACKEND] Successfully extracted colors using Backend API: ${imageUrl}`);
     } catch (error) {
         if (error?.name === "AbortError") {
             return;
         }
 
-        console.warn("获取远程动态背景失败，尝试客户端降级提取:", error);
-        debugLog("动态背景加载失败 尝试前端解析");
+        console.warn(`[Palette ERROR] Backend extraction failed:`, error);
+        debugLog("[后端解析] 失败，尝试前端降级");
 
         try {
             // 降级方案：使用客户端 Canvas 提取 (支持 PNG/WebP 且绕过服务器解码限制)
+            console.log(`[Palette FALLBACK] Attempting extraction using Frontend Canvas API...`);
             const clientPalette = await extractPaletteFromCanvas(imageUrl);
             if (requestId !== paletteRequestId) {
                 return;
@@ -2202,11 +2259,11 @@ async function updateDynamicBackground(imageUrl) {
             persistPaletteCache();
 
             queuePaletteApplication(clientPalette, imageUrl);
-            debugLog("前端解析成功");
-            debugLog("动态背景加载成功");
+            debugLog("[前端降级] 动态背景提取成功");
+            console.log(`[Palette FRONTEND] Successfully extracted colors using Frontend Canvas API: ${imageUrl}`);
         } catch (fallbackError) {
             console.warn("客户端降级提取也失败了:", fallbackError);
-            debugLog(`动态背景加载失败: ${fallbackError}`);
+            debugLog(`[前端降级] 失败: 使用默认背景`);
             if (requestId === paletteRequestId) {
                 resetDynamicBackground();
             }
@@ -5234,6 +5291,29 @@ function clearFavorites() {
     if (state.currentList === "favorite") {
         state.currentList = "playlist";
         state.currentPlaylist = "playlist";
+        // 如果清空时正在播放收藏列表的歌，停止播放
+        dom.audioPlayer.pause();
+        dom.audioPlayer.src = "";
+        state.currentTrackIndex = -1;
+        state.currentSong = null;
+        state.currentAudioUrl = null;
+        state.currentPlaybackTime = 0;
+        state.lastSavedPlaybackTime = 0;
+        dom.progressBar.value = 0;
+        dom.progressBar.max = 0;
+        dom.currentTimeDisplay.textContent = "00:00";
+        dom.durationDisplay.textContent = "00:00";
+        updateProgressBarBackground(0, 1);
+        dom.currentSongTitle.textContent = "选择一首歌曲开始播放";
+        updateMobileToolbarTitle();
+        dom.currentSongArtist.textContent = "未知艺术家";
+        showAlbumCoverPlaceholder();
+        clearLyricsContent();
+        if (dom.lyrics) {
+            dom.lyrics.dataset.placeholder = "default";
+        }
+        dom.lyrics.classList.add("empty");
+        updatePlayPauseButton();
     }
     saveFavoriteState();
     savePlayerState();
@@ -5491,7 +5571,7 @@ function waitForAudioReady(player) {
 }
 
 async function playSong(song, options = {}) {
-    const { autoplay = true, startTime = 0, preserveProgress = false } = options;
+    const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false } = options;
 
     window.clearTimeout(pendingPaletteTimer);
     state.audioReadyForPalette = false;
@@ -5504,7 +5584,10 @@ async function playSong(song, options = {}) {
         updateCurrentSongInfo(song, { loadArtwork: false });
 
         const quality = state.playbackQuality || '320';
-        const audioUrl = API.getSongUrl(song, quality);
+        let audioUrl = API.getSongUrl(song, quality);
+        if (isRetry) {
+            audioUrl += '&nocache=true';
+        }
         debugLog(`获取音频URL: ${audioUrl}`);
 
         const audioData = await API.fetchJson(audioUrl);
@@ -5603,9 +5686,18 @@ async function playSong(song, options = {}) {
         if (autoplay) {
             playPromise = dom.audioPlayer.play();
             if (playPromise !== undefined) {
-                playPromise.catch(error => {
+                playPromise.catch(async error => {
                     console.error('播放失败:', error);
-                    showNotification('播放失败，请检查网络连接', 'error');
+                    if (!isRetry) {
+                        debugLog('音频播放遇到错误，尝试刷新缓存重试...');
+                        try {
+                            await playSong(song, { ...options, isRetry: true });
+                        } catch (retryError) {
+                            showNotification('播放失败，请检查网络连接', 'error');
+                        }
+                    } else {
+                        showNotification('播放失败，请检查网络连接', 'error');
+                    }
                 });
             } else {
                 playPromise = null;
@@ -5624,6 +5716,10 @@ async function playSong(song, options = {}) {
         }
     } catch (error) {
         console.error('播放歌曲失败:', error);
+        if (!isRetry) {
+            debugLog('播放歌曲失败，尝试刷新缓存重试...', error);
+            return playSong(song, { ...options, isRetry: true });
+        }
         throw error;
     } finally {
         savePlayerState();
@@ -5827,14 +5923,29 @@ async function playOnlineSong(index) {
     const song = state.onlineSongs[index];
     if (!song) return;
 
-    state.currentTrackIndex = index;
-    state.currentPlaylist = "online";
-    state.currentList = "playlist";
+    // 检查歌曲是否已在播放列表中
+    const existingIndex = state.playlistSongs.findIndex(s => getSongKey(s) === getSongKey(song));
+
+    if (existingIndex !== -1) {
+        state.currentTrackIndex = existingIndex;
+        state.currentPlaylist = "playlist";
+        state.currentList = "playlist";
+    } else {
+        state.playlistSongs.push(song);
+        state.currentTrackIndex = state.playlistSongs.length - 1;
+        state.currentPlaylist = "playlist";
+        state.currentList = "playlist";
+    }
 
     try {
         await playSong(song);
-        updateOnlineHighlight();
+        updatePlaylistHighlight();
         updatePlayModeUI();
+        renderPlaylist();
+        updatePlaylistActionStates();
+        
+        // 可选：如果希望继续高亮“探索雷达”中的项，保留对 updateOnlineHighlight 的调用
+        // updateOnlineHighlight();
     } catch (error) {
         console.error("播放失败:", error);
         showNotification("播放失败，请稍后重试", "error");
@@ -6278,8 +6389,20 @@ function initSettings() {
     if (dom.logo) {
         dom.logo.addEventListener("dblclick", openSettingsModal);
     }
+    
+    // 移动端双击标题或图标打开设置 (优化移动端双击兼容性)
+    let lastToolbarClick = 0;
+    const handleDoubleTap = (e) => {
+        const now = Date.now();
+        if (now - lastToolbarClick < 300) {
+            e.preventDefault();
+            openSettingsModal();
+        }
+        lastToolbarClick = now;
+    };
+
     if (dom.mobileToolbarTitle) {
-        dom.mobileToolbarTitle.addEventListener("dblclick", openSettingsModal);
+        dom.mobileToolbarTitle.addEventListener("click", handleDoubleTap);
     }
 
     // 绑定按钮事件

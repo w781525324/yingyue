@@ -218,6 +218,7 @@ body.background-transitioning .background-stage__layer--transition {
     align-items: center;
     margin-bottom: 15px;
     flex-shrink: 0;
+    position: relative;
 }
 
 .search-bar-unified {
@@ -429,14 +430,13 @@ body.background-transitioning .background-stage__layer--transition {
 }
 
 .search-results-toolbar {
-    display: flex !important;
+    display: flex;
     justify-content: flex-end;
     align-items: center;
     gap: 8px;
-    padding-top: 12px;
-    padding-bottom: 12px;
-    position: sticky;
-    top: 0;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    position: relative;
     z-index: 2;
     background: none;
 }
